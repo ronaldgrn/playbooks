@@ -1,0 +1,144 @@
+# Performs a clean installation of Flynn on a server
+# All previous data and configurations will be lost
+# Tested and confirmed working on ubuntu 16.04 only
+#
+# USAGE:
+#   ansible-playbook ansible/flynn-wipe-reinstall.yml --extra-vars "host_ip=1.2.3.4 cluster_domain=cloud.domain.com"
+
+
+- hosts: localhost
+  gather_facts: False
+
+  pre_tasks:
+    - name: Init Inventory
+      add_host:
+        name: "{{ host_ip }}"
+        groups: flynn
+        ansible_python_interpreter: /usr/bin/python3
+
+
+- hosts: flynn
+  remote_user: root
+  gather_facts: False
+
+  pre_tasks:
+  - name: install python3
+    raw: bash -c "test -e /usr/bin/python3 || (apt -qqy update && apt install -qqy python3)"
+    register: output
+    changed_when: output.stdout != ""
+
+  - name: gather facts
+    setup:
+
+  tasks:
+  - name: Update all packages to the latest version
+    apt:
+      update_cache: yes
+      upgrade: yes
+
+  - name: Install UFW
+    apt:
+      name: ufw
+
+# UFW
+  - name: disable and reset ufw to installation defaults.
+    ufw:
+      state: reset
+
+  - name: Deny incoming
+    ufw:
+      policy: deny
+      direction: incoming
+      proto: any
+
+  - name: Allow outgoing
+    ufw:
+      policy: allow
+      direction: outgoing
+      proto: any
+
+  # ufw supports connection rate limiting, which is useful for protecting
+  # against brute-force login attacks. ufw will deny connections if an IP
+  # address has attempted to initiate 6 or more connections in the last
+  # 30 seconds. See  http://www.debian-administration.org/articles/187
+  # for details. Typical usage is:
+  - name: allow throttled ssh
+    ufw:
+      rule: limit
+      port: ssh
+      proto: tcp
+
+  - name: allow http (80)
+    ufw:
+      rule: allow
+      port: http
+      proto: tcp
+
+  - name: allow https (443)
+    ufw:
+      rule: allow
+      port: https
+      proto: tcp
+
+  - name: Print IP
+    debug:
+      msg: "Allowing through UFW: {{ ansible_default_ipv4.address }}"
+
+  - name: allow communication with self
+    ufw:
+      rule: allow
+      src: "{{ ansible_default_ipv4.address }}"
+
+  - name: Enable UFW
+    ufw:
+      state: enabled
+
+  - name: allow communication on flynnbr0
+    ufw:
+      rule: allow
+      direction: in
+      interface: flynnbr0
+
+  - name: allow communication on flannel.1
+    ufw:
+      rule: allow
+      direction: in
+      interface: flannel.1
+
+  - lineinfile:
+      state: present
+      path: /etc/default/ufw
+      regexp: '^DEFAULT_FORWARD_POLICY='
+      line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
+
+  - name: Reload UFW
+    ufw:
+      state: reloaded
+
+# FLYNN
+  - name: Download flynn install script
+    get_url:
+      url: https://dl.flynn.io/install-flynn
+      dest: /tmp/install-flynn
+      force: yes
+      mode: 0700
+
+  - name: Wipe and perform clean install of flynn nightly
+    command: /tmp/install-flynn --yes --clean --channel nightly
+
+  - name: Start flynn-host service
+    systemd:
+      state: started
+      name: flynn-host
+
+  - name: Bootstrap Flynn
+    environment:
+      CLUSTER_DOMAIN: "{{ cluster_domain }}"
+    command: flynn-host bootstrap --min-hosts 1
+    # args:
+    #   creates: /etc/flynn/bootstrap-manifest.json
+    register: flynn_creds
+
+  - name: Print Flynn Creds
+    debug:
+      var: flynn_creds
